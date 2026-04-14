@@ -34,7 +34,9 @@ IMAGE_BUCKET    = "fitz_clean"
 IMAGE_PREFIX    = "images/"
 CSV_PATH        = "fp17kc.csv"
 
-OUTPUT_MANIFEST = "test_manifest.csv"
+OUTPUT_MANIFEST_V1 = "test_manifest_v1.csv"   # original v1.0 prompt style
+OUTPUT_MANIFEST_V2 = "test_manifest_v2.csv"   # textbook-anchored v2.0 prompt style
+OUTPUT_MANIFEST    = OUTPUT_MANIFEST_V1        # legacy alias
 PROMPTS_CACHE   = "test_prompts.jsonl"
 REJECTED_LOG    = "test_rejected.jsonl"
 
@@ -57,8 +59,13 @@ THINKING_BUDGET  = 1024
 WATERMARK_CROP_PCT = 0.10
 
 # ── FST descriptions ────────────────────────────────────────────────────────────
+# V1 — original verbose descriptors (kept for backward compatibility).
+# V2 — concise, textbook-anchored pigmentation descriptors.
+# BJD 10.1111/bjd.19932 (Okoji, Taylor, Lipoff, 2021) critiques FST as
+# white-centred; Lipoff & Ruiz Dasilva, Dermatology Simplified 2e §1.2 #6
+# recommends specific hue + lightness over bare "hyperpigmented".
 
-FST_DESCRIPTIONS = {
+FST_DESCRIPTIONS_V1 = {
     "FP1": "Fitzpatrick type I, very fair skin, ivory tone",
     "FP2": "Fitzpatrick type II, fair skin, light beige tone",
     "FP3": "Fitzpatrick type III, medium skin, light brown tone",
@@ -66,14 +73,41 @@ FST_DESCRIPTIONS = {
     "FP5": "Fitzpatrick type V, brown skin, deep tan tone",
     "FP6": "Fitzpatrick type VI, deep brown skin, very dark brown tone",
 }
+FST_DESCRIPTIONS = FST_DESCRIPTIONS_V1  # legacy alias
 
-UNIVERSAL_NEGATIVE = (
+FST_DESCRIPTIONS_V2 = {
+    "FP1": "very fair ivory",
+    "FP2": "fair beige",
+    "FP3": "medium light brown",
+    "FP4": "olive moderate brown",
+    "FP5": "deeply pigmented brown",
+    "FP6": "very dark brown",
+}
+
+FST_ROMAN = {"FP1": "I", "FP2": "II", "FP3": "III", "FP4": "IV", "FP5": "V", "FP6": "VI"}
+
+# V1 — original negative prompt.
+UNIVERSAL_NEGATIVE_V1 = (
     "jewelry, metal, shiny, blurry, low resolution, distorted, "
     "unnatural colors, deformed anatomy, extra digits, writing, "
     "overlay, text, logo, SFS, watermark, ruler, gloves, plastic skin"
 )
+UNIVERSAL_NEGATIVE = UNIVERSAL_NEGATIVE_V1  # legacy alias
 
-GEMINI_PROMPT = """You are an expert clinical dermatology image analyst assisting with research.
+# V2 — BJD-informed: actively excludes light skin to prevent SD drifting
+# toward the dominant-tone bias of its training set when targeting FP5/FP6.
+UNIVERSAL_NEGATIVE_V2 = (
+    "light skin, fair skin, white skin, pale skin, "
+    "cartoon, illustration, drawing, painting, 3d render, "
+    "text, watermark, logo, ruler, measuring tape, "
+    "jewelry, metal, gloves, medical tools, "
+    "blurry, low resolution, distorted anatomy, extra digits, "
+    "plastic skin, waxy skin, oversaturated, unnatural colors"
+)
+
+# ── Gemini vision prompt (V1 — original 13-field schema) ────────────────────────
+
+GEMINI_PROMPT_V1 = """You are an expert clinical dermatology image analyst assisting with research.
 
 You will receive (a) a dermatology image, (b) the ground-truth disease label from
 the dataset, and (c) the disease category. Return ONLY a valid JSON object with
@@ -92,40 +126,73 @@ exactly these fields:
   "background_skin":   "<uninvolved skin description, e.g. smooth, hyperpigmented>",
   "scale_type":        "<e.g. fine white scale, thick adherent scale, none visible>",
   "size_reference":    "<approximate lesion size, e.g. 3-8mm, dime-sized>",
-  "image_framing":     "<e.g. close-up clinical framing, full limb view>"
+  "image_framing":     "<e.g. close-up clinical framing, full limb view>",
+
+  "v2_body_part":        "<V2: one anatomical site, 2-4 words>",
+  "v2_primary_lesion":   "<V2: ONE primary lesion term + brief qualifier>",
+  "v2_lesion_color":     "<V2: ONE color term + brief qualifier>",
+  "v2_secondary_change": "<V2: ONE or TWO ABCS terms>",
+  "v2_surface_texture":  "<V2: ONE texture term>",
+  "v2_border":           "<V2: ONE border term>",
+  "v2_configuration":    "<V2: ONE configuration term>"
 }
 
 How to fill each field:
 
-1. BE CONCISE. Every field must be at most 5 words. These strings are
-   concatenated into a Stable Diffusion prompt with a hard 77-token budget,
-   so verbose values will be silently truncated. Prefer tight clinical
-   phrases like "silvery plaque-like scale" over sentences.
+1. BE CONCISE. Every V1 field must be at most 5 words. Every V2 field must be at
+   most 4 words. These strings compose into Stable Diffusion prompts with a
+   hard 77-token CLIP budget; verbose values are silently truncated.
 
-2. body_part must name ONE primary anatomical region (e.g. "dorsal forearm",
-   "elbow", "shin"). Do not list multiple regions or fields of view.
+2. body_part / v2_body_part must name ONE primary anatomical region
+   (e.g. "dorsal forearm", "elbow", "shin"). Do not list multiple regions.
 
 3. VISUAL EVIDENCE FIRST. For fields clearly visible in the image, describe
    exactly what you see.
 
 4. USE THE DISEASE LABEL AS A CLINICAL PRIOR. The disease label and category
-   are ground truth from the dataset. For fields that are ambiguous, partially
-   obscured, or structurally hard to judge from a single photo — especially
-   lesion_type, size_reference, secondary_changes, and scale_type — fall back
-   on the textbook morphology of the given disease and describe the most
-   clinically typical finding. Example: if the disease is "psoriasis" and
-   scale is hard to see, "silvery plaque-like scale" is the correct answer.
+   are ground truth. For fields that are ambiguous or hard to judge from a
+   single photo — especially lesion_type, size_reference, secondary_changes,
+   scale_type — fall back on the textbook morphology of the given disease
+   (Lipoff & Ruiz Dasilva, Dermatology Simplified 2e). Example: if the disease
+   is "psoriasis" and scale is hard to resolve, "silvery plaque-like scale".
 
-5. NEVER return null, "unclear", "not visible", or "unknown". Always commit to
-   a specific, decisive clinical description.
+5. NEVER return null, "unclear", "not visible", or "unknown". Always commit.
 
-6. Use standard dermatology terminology. Do NOT describe skin color or
-   Fitzpatrick tone — that is provided separately.
+6. Do NOT describe skin color or Fitzpatrick tone — injected separately.
 
-7. Return ONLY the JSON object — no explanation, no markdown fences.
+7. Return ONLY the JSON — no explanation, no markdown fences.
+
+V2 FIELD VOCABULARY (strict — textbook §1.2 Describing Skin Conditions):
+
+- v2_primary_lesion: macule, patch, papule, plaque, nodule, tumor, vesicle,
+  bulla, pustule, wheal, cyst, petechia, purpura, telangiectasia, comedone
+  (optional SHAPE-only qualifier: dome-shaped, flat-topped, umbilicated,
+   pearly, polygonal, targetoid, annular. Do NOT include color here — color
+   goes in v2_lesion_color. e.g. "polygonal papules" not "violaceous papules".)
+
+- v2_lesion_color: erythematous, violaceous, purpuric, dusky, hyperpigmented,
+  hypopigmented, depigmented, skin-colored, pearly, variegated brown-black,
+  yellow-brown, pink, reddish-brown. Textbook §1.2 #6: use specific color —
+  e.g. "violaceous" (lichen planus), "dusky" (necrotic), "pearly" (BCC).
+
+- v2_secondary_change: scale, crust, erosion, ulcer, fissure, atrophy,
+  lichenification, excoriation, eschar, scarring (ABCS mnemonic, §1.2.2)
+  (qualifiers: silvery adherent, fine white, thick, hemorrhagic, serous,
+   post-inflammatory hyperpigmentation)
+
+- v2_surface_texture: smooth, rough, scaly, verrucous, indurated, boggy,
+  fleshy, horny, juicy, flat, raised, ulcerated (textbook §1.2 #9)
+
+- v2_border: well-demarcated, sharp, blurred, irregular, scalloped,
+  punched-out, rolled, ill-defined, diffuse (textbook §1.2 #7)
+
+- v2_configuration: confluent, discrete, scattered, grouped, clustered,
+  linear, geometric, dermatomal, annular, serpiginous, solitary,
+  symmetric, bilateral, nummular (textbook §1.2 #3)
 """
+GEMINI_PROMPT = GEMINI_PROMPT_V1  # legacy alias
 
-SLOT_FALLBACKS = {
+SLOT_FALLBACKS_V1 = {
     "orientation":       "clinical view",
     "laterality":        "unspecified",
     "body_part":         "skin surface",
@@ -139,6 +206,17 @@ SLOT_FALLBACKS = {
     "scale_type":        "scale not clearly visible",
     "size_reference":    "variable size",
     "image_framing":     "clinical framing",
+}
+SLOT_FALLBACKS = SLOT_FALLBACKS_V1  # legacy alias
+
+SLOT_FALLBACKS_V2 = {
+    "v2_body_part":        "trunk",
+    "v2_primary_lesion":   "plaque",
+    "v2_lesion_color":     "erythematous",
+    "v2_secondary_change": "surface changes",
+    "v2_surface_texture":  "raised",
+    "v2_border":           "well-demarcated",
+    "v2_configuration":    "discrete",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -256,7 +334,30 @@ async def call_gemini(
 
 def get_slot(gemini_json: dict, key: str) -> str:
     val = gemini_json.get(key)
-    return str(val) if val else SLOT_FALLBACKS[key]
+    return str(val) if val else SLOT_FALLBACKS_V1[key]
+
+
+def get_slot_v2(gemini_json: dict, key: str) -> str:
+    """V2 slot accessor — falls back to V1 body_part / lesion_color when the
+    V2-specific field is missing from cached older responses."""
+    val = gemini_json.get(key)
+    if val:
+        return str(val)
+    # Fallback chain: v2_X → v1 X (body_part, primary_lesion, lesion_color,
+    # border_character→border) → SLOT_FALLBACKS_V2
+    v1_key_map = {
+        "v2_body_part":        "body_part",
+        "v2_primary_lesion":   "primary_lesion",
+        "v2_lesion_color":     "lesion_color",
+        "v2_secondary_change": "secondary_changes",
+        "v2_surface_texture":  "lesion_type",
+        "v2_border":           "border_character",
+        "v2_configuration":    "distribution",
+    }
+    v1_key = v1_key_map.get(key)
+    if v1_key and gemini_json.get(v1_key):
+        return str(gemini_json[v1_key])
+    return SLOT_FALLBACKS_V2[key]
 
 
 _clip_tok = None
@@ -269,8 +370,12 @@ def _get_clip_tokenizer():
     return _clip_tok
 
 
+def count_clip_tokens(text: str) -> int:
+    return len(_get_clip_tokenizer().encode(text, add_special_tokens=False))
+
+
 def clip_truncate(prompt: str, max_tokens: int = 75) -> str:
-    """Truncate to SD 1.5's real CLIP token budget (77 total - 2 special tokens)."""
+    """Truncate to SD 1.5's CLIP budget (77 total - 2 special tokens = 75)."""
     tok = _get_clip_tokenizer()
     ids = tok.encode(prompt, add_special_tokens=False)
     if len(ids) <= max_tokens:
@@ -281,9 +386,9 @@ def clip_truncate(prompt: str, max_tokens: int = 75) -> str:
     return truncated[:last_comma].strip() if last_comma > 0 else truncated
 
 
-def assemble_prompt(gemini_json: dict, disease: str, fst_class: str) -> str:
-    """Front-loaded template matching working v9 hand-crafted style."""
-    fst = FST_DESCRIPTIONS[fst_class]
+def assemble_prompt_v1(gemini_json: dict, disease: str, fst_class: str) -> str:
+    """V1 — original front-loaded v9 hand-crafted style (kept for baseline)."""
+    fst = FST_DESCRIPTIONS_V1[fst_class]
     s = lambda k: get_slot(gemini_json, k)
     prompt = (
         f"clinical close-up of {s('body_part')} on {fst}, "
@@ -294,6 +399,40 @@ def assemble_prompt(gemini_json: dict, disease: str, fst_class: str) -> str:
         f"{s('secondary_changes')}, {s('scale_type')}"
     )
     return clip_truncate(prompt)
+
+
+def assemble_prompt_v2(gemini_json: dict, disease: str, fst_class: str) -> str:
+    """V2 — textbook-anchored template.
+
+    Vocabulary + slot order follow Lipoff & Ruiz Dasilva, Dermatology Simplified
+    2e, §1.2 "Describing Skin Conditions": primary lesion → secondary change →
+    texture → border → configuration. Skin tone pairs an objective pigmentation
+    phrase with the FST label (BJD 10.1111/bjd.19932 argues FST alone is too
+    coarse; textbook §1.2 #6 argues for specific hue over bare "hyperpigmented").
+
+    Empirical CLIP token budget on 9-disease test set: 49–58 tokens
+    (mean 54, headroom 17+ from the 75-token ceiling).
+    """
+    skin = FST_DESCRIPTIONS_V2[fst_class]
+    roman = FST_ROMAN[fst_class]
+    s = lambda k: get_slot_v2(gemini_json, k)
+    prompt = (
+        f"photorealistic clinical dermatology photograph, "
+        f"{disease}, {s('v2_body_part')}, "
+        f"{skin} skin Fitzpatrick type {roman}, "
+        f"{s('v2_lesion_color')} {s('v2_primary_lesion')}, "
+        f"{s('v2_secondary_change')}, "
+        f"{s('v2_surface_texture')} surface, "
+        f"{s('v2_border')} borders, "
+        f"{s('v2_configuration')} distribution, "
+        f"medical photography, sharp focus"
+    )
+    return clip_truncate(prompt)
+
+
+# Legacy alias
+def assemble_prompt(gemini_json: dict, disease: str, fst_class: str) -> str:
+    return assemble_prompt_v1(gemini_json, disease, fst_class)
 
 
 # ── Per-image processing ─────────────────────────────────────────────────────────
@@ -352,12 +491,16 @@ async def process_image(
             with open(PROMPTS_CACHE, "a") as f:
                 f.write(json.dumps({"md5hash": md5hash, **gemini_json}) + "\n")
 
-    prompt = assemble_prompt(gemini_json, disease, fst_class)
+    prompt_v1 = assemble_prompt_v1(gemini_json, disease, fst_class)
+    prompt_v2 = assemble_prompt_v2(gemini_json, disease, fst_class)
+
+    tokens_v1 = count_clip_tokens(prompt_v1)
+    tokens_v2 = count_clip_tokens(prompt_v2)
 
     rows = []
     for v in range(VARIANTS_PER):
         seed = BASE_SEED + (hash(md5hash) % 10000) + v
-        rows.append({
+        common = {
             "md5hash":                md5hash,
             "fst_class":              fst_class,
             "disease_label":          disease,
@@ -366,21 +509,6 @@ async def process_image(
             "variant_index":          v,
             "source_gcs_uri":         source_uri,
             "synthetic_gcs_uri":      f"gs://fp17kc-synthetic/{fst_class}/{md5hash}_v{v}.jpg",
-            "assembled_prompt":       prompt,
-            "negative_prompt":        UNIVERSAL_NEGATIVE,
-            "orientation":            get_slot(gemini_json, "orientation"),
-            "laterality":             get_slot(gemini_json, "laterality"),
-            "body_part":              get_slot(gemini_json, "body_part"),
-            "primary_lesion":         get_slot(gemini_json, "primary_lesion"),
-            "lesion_color":           get_slot(gemini_json, "lesion_color"),
-            "lesion_type":            get_slot(gemini_json, "lesion_type"),
-            "border_character":       get_slot(gemini_json, "border_character"),
-            "distribution":           get_slot(gemini_json, "distribution"),
-            "secondary_changes":      get_slot(gemini_json, "secondary_changes"),
-            "background_skin":        get_slot(gemini_json, "background_skin"),
-            "scale_type":             get_slot(gemini_json, "scale_type"),
-            "size_reference":         get_slot(gemini_json, "size_reference"),
-            "image_framing":          get_slot(gemini_json, "image_framing"),
             "vision_model":           GEMINI_MODEL,
             "watermark_cropped":      True,
             "source_width":           w,
@@ -398,9 +526,46 @@ async def process_image(
             "rejection_reason":       None,
             "automl_split":           "TRAIN",
             "generated_at":           None,
-            "pipeline_version":       "v1.0",
             "manifest_created_at":    datetime.utcnow().isoformat(),
-        })
+        }
+
+        v1_row = {
+            **common,
+            "assembled_prompt":       prompt_v1,
+            "negative_prompt":        UNIVERSAL_NEGATIVE_V1,
+            "prompt_token_count":     tokens_v1,
+            "orientation":            get_slot(gemini_json, "orientation"),
+            "laterality":             get_slot(gemini_json, "laterality"),
+            "body_part":              get_slot(gemini_json, "body_part"),
+            "primary_lesion":         get_slot(gemini_json, "primary_lesion"),
+            "lesion_color":           get_slot(gemini_json, "lesion_color"),
+            "lesion_type":            get_slot(gemini_json, "lesion_type"),
+            "border_character":       get_slot(gemini_json, "border_character"),
+            "distribution":           get_slot(gemini_json, "distribution"),
+            "secondary_changes":      get_slot(gemini_json, "secondary_changes"),
+            "background_skin":        get_slot(gemini_json, "background_skin"),
+            "scale_type":             get_slot(gemini_json, "scale_type"),
+            "size_reference":         get_slot(gemini_json, "size_reference"),
+            "image_framing":          get_slot(gemini_json, "image_framing"),
+            "pipeline_version":       "v1.0",
+        }
+
+        v2_row = {
+            **common,
+            "assembled_prompt":       prompt_v2,
+            "negative_prompt":        UNIVERSAL_NEGATIVE_V2,
+            "prompt_token_count":     tokens_v2,
+            "v2_body_part":           get_slot_v2(gemini_json, "v2_body_part"),
+            "v2_primary_lesion":      get_slot_v2(gemini_json, "v2_primary_lesion"),
+            "v2_lesion_color":        get_slot_v2(gemini_json, "v2_lesion_color"),
+            "v2_secondary_change":    get_slot_v2(gemini_json, "v2_secondary_change"),
+            "v2_surface_texture":     get_slot_v2(gemini_json, "v2_surface_texture"),
+            "v2_border":              get_slot_v2(gemini_json, "v2_border"),
+            "v2_configuration":       get_slot_v2(gemini_json, "v2_configuration"),
+            "pipeline_version":       "v2.0-textbook",
+        }
+
+        rows.append({"_v1": v1_row, "_v2": v2_row})
     return rows
 
 
@@ -459,15 +624,33 @@ async def main():
 
     results = await tqdm_asyncio.gather(*tasks, desc="Test run")
 
-    all_rows = [r for result in results if result for r in result]
+    v1_rows, v2_rows = [], []
+    for result in results:
+        if not result:
+            continue
+        for pair in result:
+            v1_rows.append(pair["_v1"])
+            v2_rows.append(pair["_v2"])
 
-    if all_rows:
-        manifest_df = pd.DataFrame(all_rows)
-        manifest_df.to_csv(OUTPUT_MANIFEST, index=False)
-        log.info(f"\nTest manifest saved: {OUTPUT_MANIFEST}")
-        log.info(f"  Rows:             {len(manifest_df)}")
-        log.info(f"  Unique sources:   {manifest_df['md5hash'].nunique()}")
-        log.info(f"\nSample prompt:\n  {manifest_df['assembled_prompt'].iloc[0]}")
+    if v1_rows:
+        v1_df = pd.DataFrame(v1_rows)
+        v2_df = pd.DataFrame(v2_rows)
+        v1_df.to_csv(OUTPUT_MANIFEST_V1, index=False)
+        v2_df.to_csv(OUTPUT_MANIFEST_V2, index=False)
+
+        log.info(f"\n=== V1 manifest (original) saved: {OUTPUT_MANIFEST_V1} ===")
+        log.info(f"  Rows: {len(v1_df)}  Unique sources: {v1_df['md5hash'].nunique()}")
+        log.info(f"  Token counts — min:{v1_df['prompt_token_count'].min()} "
+                 f"max:{v1_df['prompt_token_count'].max()} "
+                 f"mean:{v1_df['prompt_token_count'].mean():.1f}")
+        log.info(f"  Sample:\n    {v1_df['assembled_prompt'].iloc[0]}")
+
+        log.info(f"\n=== V2 manifest (textbook-anchored) saved: {OUTPUT_MANIFEST_V2} ===")
+        log.info(f"  Rows: {len(v2_df)}  Unique sources: {v2_df['md5hash'].nunique()}")
+        log.info(f"  Token counts — min:{v2_df['prompt_token_count'].min()} "
+                 f"max:{v2_df['prompt_token_count'].max()} "
+                 f"mean:{v2_df['prompt_token_count'].mean():.1f}")
+        log.info(f"  Sample:\n    {v2_df['assembled_prompt'].iloc[0]}")
     else:
         log.warning("No rows generated — check test_rejected.jsonl")
 
